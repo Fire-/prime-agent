@@ -1,0 +1,310 @@
+[tools]
+node = "22.22.3"
+pnpm = "latest"
+
+[env]
+_.path = ["{{config_root}}/node_modules/.bin"]
+
+[tasks.install]
+description = "Install all dependencies"
+run = "npm ci"
+
+[tasks.build]
+description = "Build all packages (TypeScript + bundle)"
+run = "npm run build"
+
+[tasks.build-coding-agent]
+description = "Build just the coding-agent package"
+run = "cd packages/coding-agent && npm run build"
+
+[tasks.dev]
+description = "Run Prime Agent from source (tsx dev mode)"
+usage = '''
+arg "[dir]" help="Working directory" default="."
+flag "--no-env" help="Unset all API keys before running"
+flag "--model <model>" help="Select model on startup"
+flag "--provider <provider>" help="Select provider on startup"
+flag "--mode <mode>" help="Output mode" {
+  choices "interactive" "json" "rpc"
+  default "interactive"
+}
+'''
+run = '''
+if [[ -n "${usage_model}" ]]; then
+  MODEL_FLAG="--model ${usage_model}"
+fi
+if [[ -n "${usage_provider}" ]]; then
+  PROVIDER_FLAG="--provider ${usage_provider}"
+fi
+if [[ "${usage_no_env}" == "true" ]]; then
+  NO_ENV_FLAG="--no-env"
+fi
+cd "${usage_dir?}" && {{config_root}}/prime-agent.sh ${NO_ENV_FLAG} --mode "${usage_mode?}" ${MODEL_FLAG} ${PROVIDER_FLAG}
+'''
+
+[tasks.run-dist]
+description = "Run Prime Agent from bundled build (faster startup)"
+usage = '''
+arg "[dir]" help="Working directory" default="."
+flag "--no-env" help="Unset all API keys before running"
+flag "--model <model>" help="Select model on startup"
+flag "--provider <provider>" help="Select provider on startup"
+'''
+run = '''
+if [[ -n "${usage_model}" ]]; then
+  MODEL_FLAG="--model ${usage_model}"
+fi
+if [[ -n "${usage_provider}" ]]; then
+  PROVIDER_FLAG="--provider ${usage_provider}"
+fi
+if [[ "${usage_no_env}" == "true" ]]; then
+  NO_ENV_FLAG="--no-env"
+fi
+cd "${usage_dir?}" && {{config_root}}/prime-agent.sh --dist ${NO_ENV_FLAG} ${MODEL_FLAG} ${PROVIDER_FLAG}
+'''
+
+[tasks.check]
+description = "Run full check suite (format, lint, typecheck, installer, browser smoke)"
+run = "npm run check"
+
+[tasks.typecheck]
+description = "Run TypeScript type checking only"
+run = "tsgo --noEmit"
+
+[tasks.test]
+description = "Run all workspace tests"
+run = "npm run test"
+
+[tasks.test-coding-agent]
+description = "Run coding-agent tests"
+run = "cd packages/coding-agent && npx tsx ../../node_modules/vitest/dist/cli.js --run"
+
+[tasks.agents]
+description = "List running Prime Agent sessions"
+run = "{{config_root}}/prime-agent.sh agents"
+
+[tasks.status]
+description = "Inspect Prime Agent background service state"
+run = "{{config_root}}/prime-agent.sh status"
+
+[tasks.doctor]
+description = "Inspect or repair Prime Agent background services"
+usage = '''
+flag "--fix" help="Attempt to fix issues automatically"
+'''
+run = '''
+if [[ "${usage_fix}" == "true" ]]; then
+  {{config_root}}/prime-agent.sh doctor --fix
+else
+  {{config_root}}/prime-agent.sh doctor
+fi
+'''
+
+[tasks.shutdown]
+description = "Stop every agent, worker, and background service"
+usage = '''
+flag "--force" help="Force shutdown without confirmation"
+'''
+run = '''
+if [[ "${usage_force}" == "true" ]]; then
+  {{config_root}}/prime-agent.sh shutdown --force
+else
+  {{config_root}}/prime-agent.sh shutdown
+fi
+'''
+
+# ── Runtime Lifecycle ───────────────────────────────────────────────────────
+# Build → smoke-test → swap (current→bak→stable fallback tier)
+#
+# Tiers:
+#   ~/.prime/agent/dist/current/  ← active build
+#   ~/.prime/agent/dist/bak/      ← previous build (rollback target)
+#   ~/.prime/agent/dist/stable/   ← pinned known-good (manual via setup-stable)
+
+[tasks.smoke-test]
+description = "Verify the built bundle can run --version"
+run = '''
+BUNDLE="{{config_root}}/packages/coding-agent/dist/bundle/cli.js"
+if [[ ! -f "$BUNDLE" ]]; then
+  echo "ERROR: Bundle not found at $BUNDLE"
+  echo "Run 'mise run build' first."
+  exit 1
+fi
+if ! node "$BUNDLE" --version >/dev/null 2>&1; then
+  echo "ERROR: Smoke test failed — bundle crashes on startup"
+  exit 1
+fi
+echo "Smoke test passed"
+'''
+
+[tasks.swap]
+description = "Promote built bundle to runtime/current (shift current→bak)"
+run = '''
+RUNTIME="${RUNTIME_DIR:-$HOME/.prime/agent}"
+DIST="$RUNTIME/dist"
+VENDOR_DIST="{{config_root}}/packages/coding-agent/dist"
+
+if [[ ! -f "$VENDOR_DIST/bundle/cli.js" ]]; then
+  echo "ERROR: No bundle found. Run 'mise run build' first."
+  exit 1
+fi
+
+# Shift tiers: bak → (dropped), current → bak
+if [[ -d "$DIST/current" ]] && [[ -f "$DIST/current/dist/bundle/cli.js" ]]; then
+  rm -rf "$DIST/bak"
+  mv "$DIST/current" "$DIST/bak"
+  echo "Previous current moved to bak"
+fi
+
+# Copy full dist output into current/dist/
+mkdir -p "$DIST/current/dist"
+cp -r "$VENDOR_DIST"/* "$DIST/current/dist/"
+
+# Generate package.json at tier root
+node "{{config_root}}/scripts/generate-runtime-package-json.cjs" \
+  "{{config_root}}/package-lock.json" \
+  "$DIST/current/package.json"
+
+# Install externals via pnpm (ignore scripts initially, rebuild after approval)
+cd "$DIST/current" && mise exec -- pnpm install --ignore-scripts
+
+# Approve and run native builds
+cd "$DIST/current" && mise exec -- pnpm approve-builds koffi zeromq >/dev/null 2>&1 || true
+cd "$DIST/current" && mise exec -- pnpm rebuild koffi zeromq >/dev/null 2>&1 || true
+
+echo "Swap complete. current/ now has the new build."
+'''
+
+[tasks.swap-back]
+description = "Restore previous build from bak to current"
+run = '''
+RUNTIME="${RUNTIME_DIR:-$HOME/.prime/agent}"
+DIST="$RUNTIME/dist"
+
+if [[ ! -d "$DIST/bak" ]] || [[ ! -f "$DIST/bak/dist/bundle/cli.js" ]]; then
+  echo "ERROR: No bak tier to restore from."
+  exit 1
+fi
+
+# Rotate: current → (dropped), bak → current
+rm -rf "$DIST/current"
+mv "$DIST/bak" "$DIST/current"
+echo "Restored bak to current."
+'''
+
+[tasks.setup-stable]
+description = "Copy current bak to stable fallback (run once with known-good build)"
+run = '''
+RUNTIME="${RUNTIME_DIR:-$HOME/.prime/agent}"
+DIST="$RUNTIME/dist"
+
+if [[ ! -d "$DIST/bak" ]] || [[ ! -f "$DIST/bak/dist/bundle/cli.js" ]]; then
+  echo "ERROR: No bak tier. Run 'mise run swap' first to create bak."
+  exit 1
+fi
+
+rm -rf "$DIST/stable"
+cp -r "$DIST/bak" "$DIST/stable"
+echo "Stable fallback set from bak."
+ls -lh "$DIST/stable/dist/bundle/cli.js"
+'''
+
+[tasks.update]
+description = "Rebuild local, build, smoke-test, and swap to runtime"
+run = '''
+mise run rebuild-local
+mise run build
+mise run smoke-test
+mise run swap
+'''
+
+[tasks.upgrade]
+description = "Full upgrade: sync overlays, rebuild, smoke-test, and swap"
+run = '''
+mise run sync
+mise run rebuild-local
+mise run build
+mise run smoke-test
+mise run swap
+'''
+
+# ── Git Overlay Workflow ────────────────────────────────────────────────────
+# Syncs overlay/* branches on top of ts/main and rebuilds the local branch.
+#
+# FROZEN TS BASE: upstream ported Prime Agent to Rust (origin/main commit
+# 39bc99a91). The TypeScript tree ends at v0.9.8 (7d442aafa), pinned locally
+# as branch ts/main. NEVER use origin/main as an overlay base — it no longer
+# contains packages/ and the overlays cannot merge onto it. If you ever want
+# to track upstream again, the overlay features must be ported to the Rust
+# crates (see VENDOR.md).
+#
+# Branch structure:
+#   ts/main              ← pinned TS base (v0.9.8, last upstream TS commit)
+#   overlay/*            ← our custom changes, overlaid onto ts/main
+#   local                ← ts/main + all overlay/* branches merged
+#
+# Workflow:
+#   1. mise run sync           (re-overlay all branches onto ts/main)
+#   2. mise run rebuild-local  (reset local to ts/main, re-merge overlays)
+
+[tasks.sync]
+description = "Re-overlay all overlay/* branches onto ts/main (pinned TS base)"
+run = '''
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "ERROR: You have uncommitted changes. Commit or stash them first."
+  git status --short
+  exit 1
+fi
+ORIGINAL_BRANCH=$(git branch --show-current)
+for b in $(git branch --list 'overlay/*' --format='%(refname:short)'); do
+  if bash ~/code/git-overlay/git-overlay ts/main "$b"; then
+    continue
+  fi
+  # Overlay failed. Check if it's actual merge conflicts.
+  if git diff --cached --diff-filter=U --name-only | grep -q .; then
+    echo "ERROR: Merge conflicts in $b. Resolve them, then run: git overlay --continue"
+    exit 1
+  fi
+  echo "ERROR: Overlay of $b failed without conflicts. See output above."
+  exit 1
+done
+git checkout "$ORIGINAL_BRANCH"
+echo "All overlay branches synced onto ts/main"
+'''
+
+[tasks.rebuild-local]
+description = "Reset local branch to ts/main and re-merge all overlay/* branches"
+run = '''
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "ERROR: You have uncommitted changes. Commit or stash them first."
+  git status --short
+  exit 1
+fi
+git checkout local
+git reset --hard ts/main
+for b in $(git branch --list 'overlay/*' --format='%(refname:short)'); do
+  if git merge "$b" --no-edit; then
+    continue
+  fi
+  # Merge failed. Check if it's actual merge conflicts.
+  if git diff --cached --diff-filter=U --name-only | grep -q .; then
+    echo "ERROR: Merge conflicts from $b. Resolve them and retry."
+    exit 1
+  fi
+  # No unmerged paths: either git-rerere auto-staged a recorded resolution or
+  # the pre-commit hook rejected the merge commit. Complete the commit without
+  # re-running hooks. --no-edit is mandatory here: merge --continue without it
+  # launches the configured GUI editor with --wait (Cursor), which blocks
+  # forever in non-interactive runs.
+  git -c core.hooksPath=/dev/null commit --no-edit
+  if [[ $? -ne 0 ]]; then
+    echo "ERROR: Could not complete the merge of $b."
+    exit 1
+  fi
+done
+echo "local branch rebuilt"
+'''
+
+[tasks.local]
+description = "Switch to local branch (ts/main + overlays)"
+run = "git checkout local"
