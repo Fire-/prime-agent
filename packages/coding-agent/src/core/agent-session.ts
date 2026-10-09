@@ -7723,6 +7723,10 @@ export class AgentSession {
 		return this._sessionInputPumpSuspended;
 	}
 
+	get isQueuedWorkSuspendedForUpdateRestart(): boolean {
+		return this._sessionInputPumpSuspended && this._sessionInputSuspendedForUpdateRestart;
+	}
+
 	get isSessionActive(): boolean {
 		return (
 			this._ipythonKernelProvisioner?.manager?.hasBackgroundWork === true ||
