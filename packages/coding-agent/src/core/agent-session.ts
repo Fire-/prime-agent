@@ -85,6 +85,7 @@ import type { AuthSourceToken } from "./auth-storage.js";
 import {
 	type AgentAutonomousConfig,
 	type AgentAutonomousStatus,
+	type AutonomousEvent,
 	type AutonomousRuntimeState,
 	addAutonomousContinuation,
 	addAutonomousUsage,
@@ -2641,6 +2642,55 @@ export class AgentSession {
 		this._emit({ type: "message_end", message });
 	}
 
+	/** Host-observable autonomous lifecycle: gate runs (which execute between
+	 * turns and would otherwise be indistinguishable from a hung run) and the
+	 * terminal stop decision land as visible custom messages in the session. */
+	private _emitAutonomousEvent(event: AutonomousEvent): void {
+		let content: string;
+		let details: Record<string, unknown> = {};
+		switch (event.type) {
+			case "gate_started":
+				content = `Autonomous gate: running \`${event.command}\` (attempt ${event.attempt}/${event.maxRetries})…`;
+				break;
+			case "gate_failed":
+				content = `Autonomous gate failed (attempt ${event.attempt}/${event.maxRetries}): \`${event.command}\` ${event.exitText}.`;
+				details = {
+					command: event.command,
+					attempt: event.attempt,
+					maxRetries: event.maxRetries,
+					exitText: event.exitText,
+					output: event.output,
+				};
+				break;
+			case "gate_passed":
+				content = `Autonomous gate passed: \`${event.command}\`.`;
+				break;
+			case "stopped":
+				content =
+					event.reason === "gate_passed"
+						? "Autonomous run complete: quality gates passed."
+						: `Autonomous run stopped: ${event.detail ?? "limit reached"}.`;
+				break;
+		}
+		const message = {
+			role: "custom" as const,
+			customType: `autonomous_${event.type}`,
+			content,
+			display: true,
+			details,
+			timestamp: Date.now(),
+		} satisfies CustomMessage<Record<string, unknown>>;
+		this.agent.state.messages.push(message);
+		this.sessionManager.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			message.details,
+		);
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
+	}
+
 	private async _handleAutonomousSlashCommand(text: string): Promise<boolean> {
 		const command = this._parseAutonomousSlashCommand(text);
 		if (!command) {
@@ -3817,6 +3867,7 @@ export class AgentSession {
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, message, {
 			cwd: this._cwd,
 			signal: this.agent.signal,
+			onEvent: (event) => this._emitAutonomousEvent(event),
 		});
 		if (!autonomousMessage) {
 			return undefined;
@@ -4380,6 +4431,7 @@ export class AgentSession {
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, context.message, {
 			cwd: this._cwd,
 			signal,
+			onEvent: (event) => this._emitAutonomousEvent(event),
 		});
 		if (autonomousMessage && this._sessionInputArrivalEpoch !== arrivalEpoch) {
 			this._restoreAutonomousRuntimeSnapshot(autonomousSnapshot);
@@ -5352,6 +5404,7 @@ export class AgentSession {
 	async refreshAutonomousGates(): Promise<void> {
 		await refreshAutonomousQualityGates(this._autonomousState, {
 			cwd: this._cwd,
+			onEvent: (event) => this._emitAutonomousEvent(event),
 		});
 	}
 

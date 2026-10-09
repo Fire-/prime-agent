@@ -127,6 +127,30 @@ export interface AutonomousDecision {
 	reason: "missing_terminal_evidence" | "gate_failed" | "not_needed" | "limit_reached";
 }
 
+/** User message queued by the autonomous continuation hook. The marker rides
+ * the wire verbatim so hosts (t3) can distinguish agent-initiated
+ * continuation prompts from their own submitted prompts and steers — those
+ * arrive as identical user-role message lifecycle events. */
+export interface AutonomousContinuationMessage extends UserMessage {
+	isAutonomousContinuation: true;
+}
+
+/** Host-observable autonomous-mode lifecycle events: gate executions run
+ * between turns (invisible otherwise — the host cannot distinguish a five
+ * minute gate command from a hung run), and the terminal stop decision. */
+export type AutonomousEvent =
+	| { type: "gate_started"; command: string; attempt: number; maxRetries: number }
+	| {
+			type: "gate_failed";
+			command: string;
+			attempt: number;
+			maxRetries: number;
+			exitText: string;
+			output: string;
+	  }
+	| { type: "gate_passed"; command: string }
+	| { type: "stopped"; reason: "gate_passed" | "limit_reached"; detail?: string };
+
 interface GitWorktreeSnapshot {
 	status: string;
 	diff: string;
@@ -136,6 +160,7 @@ interface GitWorktreeSnapshot {
 interface AutonomousOperationOptions {
 	cwd?: string;
 	signal?: AbortSignal;
+	onEvent?: (event: AutonomousEvent) => void;
 }
 
 type GateFailure = AgentAutonomousGateFailure;
@@ -290,7 +315,7 @@ export async function nextAutonomousContinuation(
 	message: AssistantMessage,
 	options: AutonomousOperationOptions = {},
 	now = Date.now(),
-): Promise<UserMessage | undefined> {
+): Promise<AutonomousContinuationMessage | undefined> {
 	options.signal?.throwIfAborted();
 	if (!state.enabled) {
 		return undefined;
@@ -311,6 +336,7 @@ export async function nextAutonomousContinuation(
 			},
 		],
 		timestamp: now,
+		isAutonomousContinuation: true,
 	};
 }
 
@@ -401,17 +427,49 @@ export async function shouldAutonomouslyContinue(
 	options.signal?.throwIfAborted();
 	if (gateResult) {
 		if (gateResult === "passed") {
+			// All gates passed: the verifier decided completion. The run stops
+			// here even though usage limits may allow more continuations.
+			options.onEvent?.({ type: "stopped", reason: "gate_passed" });
 			return { shouldContinue: false, reason: "not_needed" };
 		}
 		if (gateResult === "retry_exhausted" || autonomousLimitReason(state, now)) {
+			options.onEvent?.({
+				type: "stopped",
+				reason: "limit_reached",
+				detail:
+					gateResult === "retry_exhausted"
+						? `gate retries exhausted for \`${state.lastGateFailure?.command ?? "unknown command"}\``
+						: describeAutonomousLimit(autonomousLimitReason(state, now) ?? "maxTurns", state, now),
+			});
 			return { shouldContinue: false, reason: "limit_reached" };
 		}
 		return { shouldContinue: true, reason: "gate_failed" };
 	}
-	if (autonomousLimitReason(state, now)) {
+	const limitReason = autonomousLimitReason(state, now);
+	if (limitReason) {
+		options.onEvent?.({
+			type: "stopped",
+			reason: "limit_reached",
+			detail: describeAutonomousLimit(limitReason, state, now),
+		});
 		return { shouldContinue: false, reason: "limit_reached" };
 	}
 	return { shouldContinue: true, reason: "missing_terminal_evidence" };
+}
+
+function describeAutonomousLimit(reason: AutonomousLimitReason, state: AutonomousLimitState, now = Date.now()): string {
+	switch (reason) {
+		case "maxContinuations":
+			return `maxContinuations reached (${state.continuationsUsed}/${state.limits.maxContinuations})`;
+		case "maxTurns":
+			return `maxTurns reached (${state.turnsUsed}/${state.limits.maxTurns})`;
+		case "maxTokens":
+			return `maxTokens reached (${state.tokensUsed}/${state.limits.maxTokens})`;
+		case "timeoutMs": {
+			const elapsed = state.startedAt === undefined ? 0 : Math.max(0, now - state.startedAt);
+			return `timeoutMs reached (ran ${Math.round(elapsed / 1000)}s of ${Math.round(state.limits.timeoutMs / 1000)}s)`;
+		}
+	}
 }
 
 export function autonomousLimitReason(
@@ -441,13 +499,14 @@ export async function refreshAutonomousQualityGates(
 	if (!state.enabled || state.gates.commands.length === 0) {
 		return undefined;
 	}
-	return await runAutonomousQualityGates(state, options.cwd, options.signal);
+	return await runAutonomousQualityGates(state, options.cwd, options.signal, options.onEvent);
 }
 
 async function runAutonomousQualityGates(
 	state: AutonomousRuntimeState,
 	cwd: string | undefined,
 	signal: AbortSignal | undefined,
+	onEvent?: (event: AutonomousEvent) => void,
 ): Promise<AutonomousGateResult> {
 	signal?.throwIfAborted();
 	if (!cwd) {
@@ -470,8 +529,24 @@ async function runAutonomousQualityGates(
 				output:
 					"The autonomous gate was not rerun because the workspace has not changed since this failure. Edit source files, tests, or a blocker artifact before attempting to finish again.",
 			};
+			onEvent?.({
+				type: "gate_failed",
+				command,
+				attempt,
+				maxRetries: state.gates.maxRetries,
+				exitText: state.lastGateFailure.exitText,
+				output: state.lastGateFailure.output,
+			});
 			return attempt > state.gates.maxRetries ? "retry_exhausted" : "failed";
 		}
+		// Emitted before the command runs so a host watching the session sees
+		// activity — a multi-minute gate must not look like a hung run.
+		onEvent?.({
+			type: "gate_started",
+			command,
+			attempt: (state.gateAttempts[command] ?? 0) + 1,
+			maxRetries: state.gates.maxRetries,
+		});
 		const result = await runChildProcess(command, [], {
 			cwd,
 			shell: true,
@@ -488,6 +563,7 @@ async function runAutonomousQualityGates(
 				state.lastGateFailure = undefined;
 				state.lastGateFailureSnapshot = undefined;
 			}
+			onEvent?.({ type: "gate_passed", command });
 			continue;
 		}
 		const attempt = (state.gateAttempts[command] ?? 0) + 1;
@@ -503,6 +579,14 @@ async function runAutonomousQualityGates(
 			),
 		};
 		state.lastGateFailureSnapshot = postRunSnapshot;
+		onEvent?.({
+			type: "gate_failed",
+			command,
+			attempt,
+			maxRetries: state.gates.maxRetries,
+			exitText,
+			output: state.lastGateFailure.output,
+		});
 		return attempt > state.gates.maxRetries ? "retry_exhausted" : "failed";
 	}
 	state.lastGateFailure = undefined;

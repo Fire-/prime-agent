@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	type AutonomousEvent,
 	addAutonomousUsage,
 	createAutonomousRuntimeState,
 	DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT,
@@ -336,6 +337,95 @@ describe("AgentSession autonomous mode", () => {
 		const status = unlimited.session.getAutonomousStatus();
 		expect(isUnlimitedAutonomousLimit(status.limits.maxContinuations)).toBe(true);
 		expect(status.continuationsUsed).toBe(6);
+	});
+
+	it("marks autonomous continuation messages for host consumers", async () => {
+		const state = createAutonomousRuntimeState({ enabled: true });
+		const message = await nextAutonomousContinuation(state, fauxAssistantMessage("Working…"), {
+			cwd: process.cwd(),
+		});
+		expect(message?.role).toBe("user");
+		expect(message?.isAutonomousContinuation).toBe(true);
+		expect(message?.content).toEqual([
+			{ type: "text", text: `[autonomous-continuation]\n\n${DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT}` },
+		]);
+	});
+
+	it("emits gate lifecycle events while gates run", async () => {
+		const events: AutonomousEvent[] = [];
+		const state = createAutonomousRuntimeState({
+			enabled: true,
+			gates: { commands: [`${process.execPath} -e "process.exit(1)"`], maxRetries: 1 },
+		});
+		const command = state.gates.commands[0];
+		const decision = await shouldAutonomouslyContinue(state, fauxAssistantMessage("Done."), {
+			cwd: process.cwd(),
+			onEvent: (event) => events.push(event),
+		});
+		expect(decision).toMatchObject({ shouldContinue: true, reason: "gate_failed" });
+		expect(events).toEqual([
+			{ type: "gate_started", command, attempt: 1, maxRetries: 1 },
+			{ type: "gate_failed", command, attempt: 1, maxRetries: 1, exitText: "exited 1", output: "" },
+		]);
+	});
+
+	it("emits a stop event when all gates pass", async () => {
+		const events: AutonomousEvent[] = [];
+		const state = createAutonomousRuntimeState({
+			enabled: true,
+			gates: { commands: [`${process.execPath} -e "process.exit(0)"`] },
+		});
+		const command = state.gates.commands[0];
+		const decision = await shouldAutonomouslyContinue(state, fauxAssistantMessage("Done."), {
+			cwd: process.cwd(),
+			onEvent: (event) => events.push(event),
+		});
+		expect(decision).toMatchObject({ shouldContinue: false, reason: "not_needed" });
+		expect(events).toEqual([
+			{ type: "gate_started", command, attempt: 1, maxRetries: 3 },
+			{ type: "gate_passed", command },
+			{ type: "stopped", reason: "gate_passed" },
+		]);
+	});
+
+	it("emits a stop event when the continuation limit is reached", async () => {
+		const events: AutonomousEvent[] = [];
+		const state = createAutonomousRuntimeState({ enabled: true, maxContinuations: 2 });
+		state.continuationsUsed = 2;
+		const decision = await shouldAutonomouslyContinue(state, fauxAssistantMessage("Done."), {
+			cwd: process.cwd(),
+			onEvent: (event) => events.push(event),
+		});
+		expect(decision).toMatchObject({ shouldContinue: false, reason: "limit_reached" });
+		expect(events).toEqual([{ type: "stopped", reason: "limit_reached", detail: "maxContinuations reached (2/2)" }]);
+	});
+
+	it("surfaces gate lifecycle as custom messages in the session", async () => {
+		const harness = await createHarness({
+			autonomous: {
+				enabled: true,
+				maxContinuations: 1,
+				gates: { commands: [`${process.execPath} -e "process.exit(0)"`] },
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("Done.")]);
+
+		await harness.session.prompt("make the change");
+
+		const gateMessages = harness.session.messages
+			.filter((message) => message.role === "custom")
+			.map((message) => message as { customType?: unknown; content: unknown })
+			.filter((message) => String(message.customType ?? "").startsWith("autonomous_"))
+			.map((message) => ({
+				customType: String(message.customType),
+				text: getMessageText(message),
+			}));
+		expect(gateMessages).toEqual([
+			{ customType: "autonomous_gate_started", text: expect.stringContaining("Autonomous gate: running") },
+			{ customType: "autonomous_gate_passed", text: expect.stringContaining("Autonomous gate passed") },
+			{ customType: "autonomous_stopped", text: "Autonomous run complete: quality gates passed." },
+		]);
 	});
 
 	it("runs autonomous gates before applying usage limits", async () => {
