@@ -336,7 +336,7 @@ async function consumeChatStream(
 	let sawUsage = false;
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
-	const toolBlocksByKey = new Map<string, number>();
+	const toolBlocksByKey = new Map<string | number, number>();
 
 	const finishCurrentBlock = (block?: typeof currentBlock) => {
 		if (!block) return;
@@ -463,7 +463,7 @@ async function consumeChatStream(
 				toolCall.id && toolCall.id !== "null"
 					? toolCall.id
 					: deriveMistralToolCallId(`toolcall:${toolCall.index ?? 0}`, 0);
-			const key = `${callId}:${toolCall.index || 0}`;
+			const key = toolCall.index ?? callId;
 			const existingIndex = toolBlocksByKey.get(key);
 			let block: (ToolCall & { partialArgs?: string }) | undefined;
 
