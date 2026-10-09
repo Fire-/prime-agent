@@ -6284,8 +6284,18 @@ export class DaemonSupervisor {
 			}
 			if (client.deferredSessionPayloadsDropped?.has(activeSessionId)) continue;
 			if (client.backpressured === true) {
-				this.queueCatchup(client, activeSessionId, outboundType === "session_replaced" ? "replacement" : "resync");
-				continue;
+				// Snapshot catch-up only works for clients that consume snapshots.
+				// Event-streaming clients (RPC mode) would silently lose skipped
+				// events. Node buffers socket writes until drain, so writing
+				// through is lossless.
+				if (client.supportsExtensionUi !== true) {
+					this.queueCatchup(
+						client,
+						activeSessionId,
+						outboundType === "session_replaced" ? "replacement" : "resync",
+					);
+					continue;
+				}
 			}
 			this.writeSerialized(client, publicPayload);
 		}
