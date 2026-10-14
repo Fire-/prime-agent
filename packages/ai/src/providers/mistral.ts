@@ -327,6 +327,9 @@ async function consumeChatStream(
 			for (const item of contentItems) {
 				if (typeof item === "string") {
 					const textDelta = sanitizeSurrogates(item);
+					// GLM models on Mistral send empty content deltas around thinking and tool calls.
+					// Opening a block for them splits thinking into multiple blocks, which Mistral rejects on replay.
+					if (!textDelta) continue;
 					if (!currentBlock || currentBlock.type !== "text") {
 						finishCurrentBlock(currentBlock);
 						currentBlock = { type: "text", text: "" };
@@ -368,6 +371,7 @@ async function consumeChatStream(
 
 				if (item.type === "text") {
 					const textDelta = sanitizeSurrogates(item.text);
+					if (!textDelta) continue;
 					if (!currentBlock || currentBlock.type !== "text") {
 						finishCurrentBlock(currentBlock);
 						currentBlock = { type: "text", text: "" };
@@ -519,9 +523,22 @@ function toChatMessages(messages: Message[], supportsImages: boolean): ChatCompl
 				}
 				if (block.type === "thinking") {
 					if (block.thinking.trim().length > 0) {
+						// Mistral rejects "Expected at most one leading ThinkChunk" on replay, and GLM
+						// streams can split one reasoning burst across several thinking blocks (empty
+						// content deltas between them serialize to nothing). Coalesce neighboring
+						// thinking blocks into a single chunk so split histories stay replayable.
+						const previous = contentParts[contentParts.length - 1];
+						const sanitized = sanitizeSurrogates(block.thinking);
+						if (previous?.type === "thinking" && previous.thinking.length > 0) {
+							const last = previous.thinking[previous.thinking.length - 1];
+							if (last.type === "text") {
+								last.text += `\n\n${sanitized}`;
+								continue;
+							}
+						}
 						contentParts.push({
 							type: "thinking",
-							thinking: [{ type: "text", text: sanitizeSurrogates(block.thinking) }],
+							thinking: [{ type: "text", text: sanitized }],
 						});
 					}
 					continue;

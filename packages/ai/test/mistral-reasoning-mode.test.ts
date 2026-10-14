@@ -130,3 +130,47 @@ describe("Mistral tool schema serialization", () => {
 		expect(result.errorMessage).not.toContain("Input validation failed");
 	});
 });
+
+describe("Mistral history serialization", () => {
+	it("coalesces adjacent thinking blocks into one leading chunk", async () => {
+		const model = {
+			...getFixtureModel<"mistral-conversations">("mistral", "magistral-medium-latest")!,
+			baseUrl: "http://127.0.0.1:9",
+		} as Model<"mistral-conversations">;
+		let serialized: unknown[] | undefined;
+		await streamSimple(
+			model,
+			{
+				messages: [
+					{ role: "user", content: "hello", timestamp: 1 },
+					{
+						role: "assistant",
+						provider: "mistral",
+						api: "mistral-conversations",
+						model: "magistral-medium-latest",
+						stopReason: "stop",
+						usage: {},
+						content: [
+							{ type: "thinking", thinking: "first part" },
+							{ type: "text", text: "" },
+							{ type: "thinking", thinking: "second part" },
+						],
+						timestamp: 2,
+					} as never,
+				],
+			} as Context,
+			{
+				apiKey: "fake-key",
+				onPayload: (payload) => {
+					serialized = (payload as { messages: Array<{ role: string; content?: unknown[] }> }).messages
+						.at(-1)
+						?.content?.filter((part) => (part as { type?: string }).type === "thinking");
+					return payload;
+				},
+			},
+		).result();
+		expect(serialized).toEqual([
+			{ type: "thinking", thinking: [{ type: "text", text: "first part\n\nsecond part" }] },
+		]);
+	});
+});
