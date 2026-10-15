@@ -489,7 +489,7 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             pids: list[int] = []
             original_init = bash_module.BashHandle.__init__
 
-            def capturing_init(handle_self, command):
+            def capturing_init(handle_self, command, timeout=None):
                 original_init(handle_self, command)
                 pids.append(handle_self._pid)
 
@@ -517,7 +517,7 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             pids: list[int] = []
             original_init = bash_module.BashHandle.__init__
 
-            def capturing_init(handle_self, command):
+            def capturing_init(handle_self, command, timeout=None):
                 original_init(handle_self, command)
                 pids.append(handle_self._pid)
 
@@ -592,7 +592,7 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
         pids: list[int] = []
         original_init = bash_module.BashHandle.__init__
 
-        def capturing_init(handle_self, command):
+        def capturing_init(handle_self, command, timeout=None):
             original_init(handle_self, command)
             pids.append(handle_self._pid)
 
@@ -1332,6 +1332,58 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             result = await bash("echo ok")
         self.assertEqual(result.exit_code, 0)
         self.assertIn("ok", result.output)
+
+    async def test_one_shot_default_timeout_kills_and_raises(self):
+        with mock.patch.dict(
+            os.environ, {bash_module.DEFAULT_ONE_SHOT_TIMEOUT_ENV: "0.3"}
+        ):
+            handle = bash("echo started; sleep 30")
+            with self.assertRaises(bash_module.BashTimeoutError) as caught:
+                await handle
+        message = str(caught.exception)
+        self.assertIn("timed out after 0.3s", message)
+        self.assertIn("await bash(cmd, timeout=<seconds>)", message)
+        self.assertIn("h = bash(cmd)", message)
+        self.assertIn(bash_module.DEFAULT_ONE_SHOT_TIMEOUT_ENV, message)
+        self.assertFalse(handle.running)
+        result = handle.poll()
+        self.assertIsNotNone(result)
+        self.assertEqual(result.exit_code, 124)
+
+    async def test_explicit_timeout_arms_at_spawn_for_background_handles(self):
+        handle = bash("echo up; sleep 30", timeout=0.3)
+        # Touch the handle API first: this is a deliberate background handle,
+        # so the await only waits instead of raising.
+        self.assertTrue(handle.running)
+        result = await asyncio.wait_for(handle, timeout=10)
+        self.assertEqual(result.exit_code, 124)
+
+    async def test_background_handle_ignores_default_timeout(self):
+        with mock.patch.dict(
+            os.environ, {bash_module.DEFAULT_ONE_SHOT_TIMEOUT_ENV: "0.3"}
+        ):
+            handle = bash("echo up; sleep 1")
+            await asyncio.sleep(0.6)
+            self.assertTrue(handle.running)
+            result = await asyncio.wait_for(handle, timeout=10)
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_explicit_zero_disables_default_timeout(self):
+        with mock.patch.dict(
+            os.environ, {bash_module.DEFAULT_ONE_SHOT_TIMEOUT_ENV: "0.3"}
+        ):
+            result = await asyncio.wait_for(bash("sleep 0.6", timeout=0), timeout=10)
+        self.assertEqual(result.exit_code, 0)
+
+    async def test_invalid_default_timeout_env_raises(self):
+        with mock.patch.dict(
+            os.environ, {bash_module.DEFAULT_ONE_SHOT_TIMEOUT_ENV: "soon"}
+        ):
+            with self.assertRaises(ValueError):
+                await bash("echo hi")
+
+    def test_default_one_shot_timeout_constant(self):
+        self.assertEqual(bash_module.DEFAULT_ONE_SHOT_TIMEOUT_SECONDS, 120.0)
 
 
 async def _poll_group_dead(pgid: int, timeout: float = 5.0) -> None:

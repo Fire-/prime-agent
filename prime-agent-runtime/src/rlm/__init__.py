@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .bash import BashHandle, BashResult, bash
+from .bash import BashHandle, BashResult, BashTimeoutError, bash
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
 
 _NOT_CALLABLE_MESSAGE = "'rlm' is not callable; spawn a child with: handle = await rlm.spawn('sub-task', name='worker')"
@@ -590,6 +590,7 @@ sys.modules[__name__].__class__ = _NotCallableModule
 __all__ = [
     "BashHandle",
     "BashResult",
+    "BashTimeoutError",
     "HarnessEntry",
     "HarnessScope",
     "HarnessState",
