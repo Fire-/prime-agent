@@ -1,0 +1,1 @@
+- Fixed event loss for RPC event-streaming clients when the daemon socket is backpressured; events are now written through instead of being replaced by a snapshot catch-up those clients cannot consume.

@@ -7015,12 +7015,18 @@ export class AgentDaemon {
 			}
 			if (client.deferredSessionFramesDropped?.has(state.activeSessionId)) continue;
 			if (client.backpressured === true) {
-				this.queueClientCatchup(
-					client,
-					state.activeSessionId,
-					sequencedMessage.type === "session_replaced" ? "replacement" : "resync",
-				);
-				continue;
+				// Snapshot catch-up only works for clients that consume snapshots.
+				// Event-streaming clients (RPC mode) would silently lose skipped
+				// events. Node buffers socket writes until drain, so writing
+				// through is lossless.
+				if (client.supportsExtensionUi !== true) {
+					this.queueClientCatchup(
+						client,
+						state.activeSessionId,
+						sequencedMessage.type === "session_replaced" ? "replacement" : "resync",
+					);
+					continue;
+				}
 			}
 			if (
 				sequencedMessage.type === "session_replaced" &&
