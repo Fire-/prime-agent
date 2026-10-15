@@ -1,0 +1,1 @@
+- Fixed fragmented Mistral tool calls splitting into separate tool-call blocks when continuation chunks omit the tool-call id. GLM models streamed through `api.mistral.ai` split tool arguments across indexed chunks; those continuations are now merged by chunk index (backport of pi fix for earendil-works/pi#8387).
