@@ -3,34 +3,47 @@ import { getFixtureModel } from "./fixture-models.js";
 
 const { activeStream } = vi.hoisted(() => ({ activeStream: { current: null as AsyncIterable<unknown> | null } }));
 
-const { degenerateWithUsage, degenerateWithoutUsage, healthyStream } = vi.hoisted(() => {
-	// Degenerate stops (pi#9674 family): GLM on Mistral ends with finish_reason
-	// "stop" while billing zero completion tokens and emitting no visible content.
-	const delta = (content: unknown, finishReason: string | null = null, usage?: unknown) => ({
-		data: {
-			id: "chatcmpl-degenerate",
-			choices: [{ index: 0, delta: { role: "assistant", content }, finishReason }],
-			...(usage === undefined ? {} : { usage }),
-		},
-	});
-	const thinking = [{ type: "thinking", thinking: [{ type: "text", text: "internal reasoning only" }] }];
-	const iterator = (chunks: unknown[]) => ({
-		async *[Symbol.asyncIterator]() {
-			yield* chunks;
-		},
-	});
-	return {
-		degenerateWithUsage: iterator([
-			delta(thinking),
-			delta("", "stop", { promptTokens: 318925, completionTokens: 0, totalTokens: 318925 }),
-		]),
-		degenerateWithoutUsage: iterator([delta(thinking), delta("", "stop")]),
-		healthyStream: iterator([
-			delta("Visible answer."),
-			delta("", "stop", { promptTokens: 100, completionTokens: 5, totalTokens: 105 }),
-		]),
-	};
-});
+const { degenerateWithUsage, degenerateWithoutUsage, healthyStream, thinkingOnlyBilled, thinkingThenText } = vi.hoisted(
+	() => {
+		// Degenerate stops (pi#9674 family): GLM on Mistral ends with finish_reason
+		// "stop" while billing zero completion tokens and emitting no visible content.
+		const delta = (content: unknown, finishReason: string | null = null, usage?: unknown) => ({
+			data: {
+				id: "chatcmpl-degenerate",
+				choices: [{ index: 0, delta: { role: "assistant", content }, finishReason }],
+				...(usage === undefined ? {} : { usage }),
+			},
+		});
+		const thinking = [{ type: "thinking", thinking: [{ type: "text", text: "internal reasoning only" }] }];
+		const iterator = (chunks: unknown[]) => ({
+			async *[Symbol.asyncIterator]() {
+				yield* chunks;
+			},
+		});
+		return {
+			degenerateWithUsage: iterator([
+				delta(thinking),
+				delta("", "stop", { promptTokens: 318925, completionTokens: 0, totalTokens: 318925 }),
+			]),
+			degenerateWithoutUsage: iterator([delta(thinking), delta("", "stop")]),
+			healthyStream: iterator([
+				delta("Visible answer."),
+				delta("", "stop", { promptTokens: 100, completionTokens: 5, totalTokens: 105 }),
+			]),
+			// 2026-10-15 incident: reasoning completes with a plan, then stop with
+			// 201 billed output tokens and no visible content.
+			thinkingOnlyBilled: iterator([
+				delta(thinking),
+				delta("", "stop", { promptTokens: 300, completionTokens: 201, totalTokens: 501 }),
+			]),
+			thinkingThenText: iterator([
+				delta(thinking),
+				delta([{ type: "text", text: "Done after reasoning." }]),
+				delta("", "stop", { promptTokens: 300, completionTokens: 201, totalTokens: 501 }),
+			]),
+		};
+	},
+);
 
 vi.mock("@mistralai/mistralai", () => ({
 	HTTPClient: class {
@@ -76,10 +89,28 @@ describe("Mistral degenerate stop detection", () => {
 		expect(failureDiagnostic(result)?.details?.kind).toBe("degenerate_stop");
 	});
 
+	it("fails a thinking-only stop as degenerate even with billed output", async () => {
+		activeStream.current = thinkingOnlyBilled;
+		const result = await runStream();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("degenerate");
+		expect(failureDiagnostic(result)?.details?.kind).toBe("degenerate_stop");
+	});
+
 	it("lets healthy stops through", async () => {
 		activeStream.current = healthyStream;
 		const result = await runStream();
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "Visible answer." }]);
+	});
+
+	it("lets thinking-then-text stops through", async () => {
+		activeStream.current = thinkingThenText;
+		const result = await runStream();
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([
+			{ type: "thinking", thinking: "internal reasoning only" },
+			{ type: "text", text: "Done after reasoning." },
+		]);
 	});
 });

@@ -615,12 +615,19 @@ function applyRawMistralUsage(
 	calculateCost(model, output.usage);
 }
 
-/** A clean stop that produced nothing chargeable: GLM serving bug (pi#9674 family). */
+/**
+ * A clean stop that produced nothing visible: GLM serving bugs (pi#9674
+ * family). Zero billed output, or a thinking-only message — reasoning that
+ * ends in a plan with no text or tool call reads as a successful turn but
+ * leaves the user with nothing, so retry it regardless of billed usage.
+ */
 function isDegenerateMistralStop(output: AssistantMessage, sawUsage: boolean): boolean {
 	if (output.stopReason !== "stop") return false;
+	const hasVisibleContent = output.content.some((block) => block.type === "text" || block.type === "toolCall");
+	if (!hasVisibleContent && output.content.some((block) => block.type === "thinking")) return true;
 	if (sawUsage) return output.usage.output === 0;
 	// No usage at all: treat a stop with nothing visible as degenerate too.
-	return !output.content.some((block) => block.type === "text" || block.type === "toolCall");
+	return !hasVisibleContent;
 }
 
 function toFunctionTools(tools: Tool[]): Array<FunctionTool & { type: "function" }> {
