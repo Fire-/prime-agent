@@ -1,4 +1,5 @@
-import { Mistral } from "@mistralai/mistralai";
+import type { Fetcher } from "@mistralai/mistralai";
+import { HTTPClient, Mistral } from "@mistralai/mistralai";
 import type {
 	ChatCompletionStreamRequest,
 	ChatCompletionStreamRequestMessage,
@@ -26,7 +27,12 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { recordStreamFailure, streamFailureFromStopReason } from "../utils/stream-failure.js";
+import {
+	recordStreamFailure,
+	StreamFailureError,
+	streamFailureFromStopReason,
+	streamFailureMessage,
+} from "../utils/stream-failure.js";
 import { buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -60,10 +66,44 @@ export const streamMistral: StreamFunction<"mistral-conversations", MistralOptio
 				throw new Error(`No API key for provider: ${model.provider}`);
 			}
 
+			// The SDK's inbound schema strips cache fields Mistral sends on the wire, so tee
+			// the SSE body and keep the last raw usage chunk for cache accounting.
+			let resolveRawUsage: (usage: Record<string, unknown> | null) => void;
+			const rawUsagePromise = new Promise<Record<string, unknown> | null>((resolve) => {
+				resolveRawUsage = resolve;
+			});
+			// With a mocked SDK the fetcher never runs; only await the promise once it has.
+			let rawCaptureStarted = false;
+			const rawUsageFetcher: Fetcher = async (input, init) => {
+				rawCaptureStarted = true;
+				try {
+					const response = await globalThis.fetch(input, init);
+					if (!response.ok || !response.body) {
+						resolveRawUsage(null);
+						return response;
+					}
+					if (!(response.headers.get("content-type") ?? "").includes("text/event-stream")) {
+						resolveRawUsage(null);
+						return response;
+					}
+					const [sdkBody, rawBody] = response.body.tee();
+					void captureRawMistralUsage(rawBody, resolveRawUsage);
+					return new Response(sdkBody, {
+						status: response.status,
+						statusText: response.statusText,
+						headers: response.headers,
+					});
+				} catch (error) {
+					resolveRawUsage(null);
+					throw error;
+				}
+			};
+
 			// Intentionally per-request: avoids shared SDK mutable state across concurrent consumers.
 			const mistral = new Mistral({
 				apiKey,
 				serverURL: model.baseUrl,
+				httpClient: new HTTPClient({ fetcher: rawUsageFetcher }),
 			});
 
 			const normalizeMistralToolCallId = createMistralToolCallIdNormalizer();
@@ -76,7 +116,11 @@ export const streamMistral: StreamFunction<"mistral-conversations", MistralOptio
 			}
 			const mistralStream = await mistral.chat.stream(payload, buildRequestOptions(model, options));
 			stream.push({ type: "start", partial: output });
-			await consumeChatStream(model, output, stream, mistralStream);
+			const sawUsage = await consumeChatStream(model, output, stream, mistralStream);
+			const rawUsage = rawCaptureStarted ? await rawUsagePromise : null;
+			if (rawUsage) {
+				applyRawMistralUsage(model, output, rawUsage);
+			}
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -84,6 +128,24 @@ export const streamMistral: StreamFunction<"mistral-conversations", MistralOptio
 
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
 				throw streamFailureFromStopReason(output.stopReasonRaw);
+			}
+
+			// GLM models on Mistral intermittently terminate with a clean "stop" while
+			// billing zero completion tokens, leaving a thinking-only message that reads
+			// as a successful turn. Fail it as a retryable degenerate stream instead so
+			// the auto-retry loop re-issues the request rather than ending silently.
+			if (isDegenerateMistralStop(output, sawUsage || rawUsage !== null)) {
+				throw new StreamFailureError(
+					streamFailureMessage(
+						{
+							kind: "degenerate_stop",
+							providerErrorType: "degenerate_stream",
+							...(output.responseId ? { requestId: output.responseId } : {}),
+						},
+						`finish_reason=stop with ${output.usage.output} completion tokens (input ${output.usage.input + output.usage.cacheRead}, cached ${output.usage.cacheRead})`,
+					),
+					{ kind: "degenerate_stop", providerErrorType: "degenerate_stream" },
+				);
 			}
 
 			stream.push({ type: "done", reason: output.stopReason, message: output });
@@ -269,8 +331,9 @@ async function consumeChatStream(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	mistralStream: AsyncIterable<CompletionEvent>,
-): Promise<void> {
+): Promise<boolean> {
 	let currentBlock: TextContent | ThinkingContent | null = null;
+	let sawUsage = false;
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
 	const toolBlocksByKey = new Map<string, number>();
@@ -303,6 +366,7 @@ async function consumeChatStream(
 		output.responseId ||= chunk.id;
 
 		if (chunk.usage) {
+			sawUsage = true;
 			output.usage.input = chunk.usage.promptTokens || 0;
 			output.usage.output = chunk.usage.completionTokens || 0;
 			output.usage.cacheRead = 0;
@@ -327,6 +391,9 @@ async function consumeChatStream(
 			for (const item of contentItems) {
 				if (typeof item === "string") {
 					const textDelta = sanitizeSurrogates(item);
+					// GLM models on Mistral send empty content deltas around thinking and tool calls.
+					// Opening a block for them splits thinking into multiple blocks, which Mistral rejects on replay.
+					if (!textDelta) continue;
 					if (!currentBlock || currentBlock.type !== "text") {
 						finishCurrentBlock(currentBlock);
 						currentBlock = { type: "text", text: "" };
@@ -368,6 +435,7 @@ async function consumeChatStream(
 
 				if (item.type === "text") {
 					const textDelta = sanitizeSurrogates(item.text);
+					if (!textDelta) continue;
 					if (!currentBlock || currentBlock.type !== "text") {
 						finishCurrentBlock(currentBlock);
 						currentBlock = { type: "text", text: "" };
@@ -450,6 +518,109 @@ async function consumeChatStream(
 			partial: output,
 		});
 	}
+	return sawUsage;
+}
+
+/** Read the cached-token count off a raw Mistral usage object, tolerating any
+ * of the shapes seen across their chat and conversations endpoints. */
+export function getMistralCachedPromptTokens(usage: unknown, promptTokens: number): number {
+	const rawUsage = usage as {
+		promptTokensDetails?: { cachedTokens?: unknown } | null;
+		prompt_tokens_details?: { cached_tokens?: unknown } | null;
+		promptTokenDetails?: { cachedTokens?: unknown } | null;
+		prompt_token_details?: { cached_tokens?: unknown } | null;
+		numCachedTokens?: unknown;
+		num_cached_tokens?: unknown;
+	};
+	const rawCachedTokens =
+		rawUsage.promptTokensDetails?.cachedTokens ??
+		rawUsage.prompt_tokens_details?.cached_tokens ??
+		rawUsage.promptTokenDetails?.cachedTokens ??
+		rawUsage.prompt_token_details?.cached_tokens ??
+		rawUsage.numCachedTokens ??
+		rawUsage.num_cached_tokens ??
+		0;
+	const cachedTokens = typeof rawCachedTokens === "number" && Number.isFinite(rawCachedTokens) ? rawCachedTokens : 0;
+	return Math.min(promptTokens, Math.max(0, cachedTokens));
+}
+
+/** Sentinel Mistral uses to end an SSE stream. */
+const DONE_MARKER = String.fromCharCode(91, 68, 79, 78, 69, 93);
+
+/** Parse the teed raw SSE copy and resolve with the last usage chunk, if any. */
+async function captureRawMistralUsage(
+	body: ReadableStream<Uint8Array>,
+	resolve: (usage: Record<string, unknown> | null) => void,
+): Promise<void> {
+	const reader = body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	let lastUsage: Record<string, unknown> | null = null;
+	const scanLine = (line: string) => {
+		if (!line.startsWith("data:")) return;
+		const data = line.slice(5).trim();
+		if (!data || data === DONE_MARKER) return;
+		try {
+			const parsed = JSON.parse(data) as { usage?: unknown };
+			if (parsed.usage && typeof parsed.usage === "object") {
+				lastUsage = parsed.usage as Record<string, unknown>;
+			}
+		} catch {
+			// Split mid-JSON across reads: the next chunk completes the line.
+		}
+	};
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			let index = buffer.indexOf("\n");
+			while (index !== -1) {
+				scanLine(buffer.slice(0, index).trim());
+				buffer = buffer.slice(index + 1);
+				index = buffer.indexOf("\n");
+			}
+		}
+		buffer += decoder.decode();
+		for (const line of buffer.split("\n")) scanLine(line.trim());
+	} catch {
+		// The SDK's copy of the stream reports transport errors; raw capture stays silent.
+	} finally {
+		try {
+			await reader.cancel();
+		} catch {}
+		resolve(lastUsage);
+	}
+}
+
+/** Overwrite the SDK-parsed usage with the raw wire numbers, including cache. */
+function applyRawMistralUsage(
+	model: Model<"mistral-conversations">,
+	output: AssistantMessage,
+	rawUsage: Record<string, unknown>,
+): void {
+	const promptTokens =
+		typeof rawUsage.prompt_tokens === "number" ? rawUsage.prompt_tokens : output.usage.input + output.usage.cacheRead;
+	const cachedPromptTokens = getMistralCachedPromptTokens(rawUsage, promptTokens);
+	const completionTokens =
+		typeof rawUsage.completion_tokens === "number" ? rawUsage.completion_tokens : output.usage.output;
+	output.usage.input = Math.max(0, promptTokens - cachedPromptTokens);
+	output.usage.output = completionTokens;
+	output.usage.cacheRead = cachedPromptTokens;
+	output.usage.cacheWrite = 0;
+	output.usage.totalTokens =
+		typeof rawUsage.total_tokens === "number"
+			? rawUsage.total_tokens
+			: output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+	calculateCost(model, output.usage);
+}
+
+/** A clean stop that produced nothing chargeable: GLM serving bug (pi#9674 family). */
+function isDegenerateMistralStop(output: AssistantMessage, sawUsage: boolean): boolean {
+	if (output.stopReason !== "stop") return false;
+	if (sawUsage) return output.usage.output === 0;
+	// No usage at all: treat a stop with nothing visible as degenerate too.
+	return !output.content.some((block) => block.type === "text" || block.type === "toolCall");
 }
 
 function toFunctionTools(tools: Tool[]): Array<FunctionTool & { type: "function" }> {
@@ -519,9 +690,22 @@ function toChatMessages(messages: Message[], supportsImages: boolean): ChatCompl
 				}
 				if (block.type === "thinking") {
 					if (block.thinking.trim().length > 0) {
+						// Mistral rejects "Expected at most one leading ThinkChunk" on replay, and GLM
+						// streams can split one reasoning burst across several thinking blocks (empty
+						// content deltas between them serialize to nothing). Coalesce neighboring
+						// thinking blocks into a single chunk so split histories stay replayable.
+						const previous = contentParts[contentParts.length - 1];
+						const sanitized = sanitizeSurrogates(block.thinking);
+						if (previous?.type === "thinking" && previous.thinking.length > 0) {
+							const last = previous.thinking[previous.thinking.length - 1];
+							if (last.type === "text") {
+								last.text += `\n\n${sanitized}`;
+								continue;
+							}
+						}
 						contentParts.push({
 							type: "thinking",
-							thinking: [{ type: "text", text: sanitizeSurrogates(block.thinking) }],
+							thinking: [{ type: "text", text: sanitized }],
 						});
 					}
 					continue;
