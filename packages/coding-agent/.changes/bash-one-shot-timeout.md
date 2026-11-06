@@ -1,0 +1,2 @@
+- Added a default 120s timeout for one-shot `await bash(cmd)` calls; timed-out commands are killed and the error explains how to extend the timeout or background the command. Configure via `PRIME_AGENT_BASH_DEFAULT_TIMEOUT` (seconds, 0 disables) or per call with `timeout=<seconds>`.
+- Added periodic still-running updates for silent ipython cells so long-running commands stay visible in headless clients.

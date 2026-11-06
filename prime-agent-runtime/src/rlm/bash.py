@@ -41,6 +41,49 @@ _COMPLETION_SUFFIX = b"\x1f"
 _CANCEL_TERM_GRACE = 0.5
 _CANCEL_KILL_WAIT = 2.0
 _COMPLETION_NOTICE_COMMAND_CAP = 1000
+# Owned one-shot awaits (`await bash(cmd)`) are bounded by default so a hung
+# foreground command cannot stall the cell (and the host's turn) forever.
+# Background handles (`h = bash(cmd)`) are never bounded by the default.
+DEFAULT_ONE_SHOT_TIMEOUT_SECONDS = 120.0
+DEFAULT_ONE_SHOT_TIMEOUT_ENV = "PRIME_AGENT_BASH_DEFAULT_TIMEOUT"
+_TIMEOUT_EXIT_CODE = 124
+
+
+class BashTimeoutError(TimeoutError):
+    """Raised when an owned one-shot `await bash(cmd)` exceeds its timeout."""
+
+
+def _default_one_shot_timeout() -> float:
+    """Resolve the default one-shot timeout: env override, else the built-in.
+
+    A malformed env value raises so misconfiguration surfaces immediately
+    instead of silently disabling the bound.
+    """
+    raw = os.environ.get(DEFAULT_ONE_SHOT_TIMEOUT_ENV)
+    if raw is None or raw == "":
+        return DEFAULT_ONE_SHOT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"{DEFAULT_ONE_SHOT_TIMEOUT_ENV} must be a number of seconds, got {raw!r}"
+        ) from None
+    if value < 0:
+        raise ValueError(
+            f"{DEFAULT_ONE_SHOT_TIMEOUT_ENV} must be >= 0 seconds (0 disables the default), got {raw!r}"
+        )
+    return value
+
+
+def _timeout_message(seconds: float) -> str:
+    return (
+        f"bash command timed out after {seconds:g}s and its process group was killed. "
+        "If the command legitimately needs more time, re-run it with an explicit timeout: "
+        "`await bash(cmd, timeout=<seconds>)`. For unbounded commands, run them in the "
+        "background instead: `h = bash(cmd)` and inspect with `await h`, `h.poll()`, or "
+        f"`h.tail()`. The default one-shot timeout is configurable via "
+        f"{DEFAULT_ONE_SHOT_TIMEOUT_ENV} (seconds; 0 disables it)."
+    )
 _ASYNCIO_WRAPPER_CALLBACKS = {
     ("asyncio.tasks", "gather.<locals>._done_callback"),
     ("asyncio.tasks", "shield.<locals>._inner_done_callback"),
@@ -231,7 +274,7 @@ class BashHandle:
     handle; later awaits only wait and cancelling them leaves it running.
     """
 
-    def __init__(self, command: str) -> None:
+    def __init__(self, command: str, timeout: float | None = None) -> None:
         # Every asyncio use in this module runs on a handle path (bash() is the
         # only constructor), so bind the module global here, before
         # _schedule_background_completion_notice or any await can run.
@@ -239,6 +282,17 @@ class BashHandle:
         import asyncio
 
         self.command = command
+        # Timeout bookkeeping. An explicit timeout>0 arms a group-kill timer at
+        # spawn (any usage, including background handles); timeout=0 disables
+        # bounding entirely; None leaves the owned one-shot await to arm the
+        # default at await time so background handles stay unbounded.
+        self._explicit_timeout = timeout
+        self._timeout_disabled = timeout == 0
+        self._timeout_timer: threading.Timer | None = None
+        self._timeout_seconds: float | None = None
+        self._timeout_lock = threading.Lock()
+        self._timed_out = threading.Event()
+        self._result_timed_out = False
         completion_context = _current_cell_completion_context()
         self._creating_cell_finished = completion_context[0] if completion_context else None
         self._creating_cell_task = completion_context[1] if completion_context else None
@@ -366,6 +420,8 @@ class BashHandle:
         threading.Thread(target=self._pump, daemon=True).start()
         threading.Thread(target=self._report, daemon=True).start()
         threading.Thread(target=self._watch, daemon=True).start()
+        if self._explicit_timeout is not None and self._explicit_timeout > 0:
+            self._arm_timeout(self._explicit_timeout)
         self._schedule_background_completion_notice()
 
     @property
@@ -423,6 +479,26 @@ class BashHandle:
     def _force_kill(self) -> None:
         if not self._reaped:
             _signal_group(self._pid, signal.SIGKILL)
+
+    def _arm_timeout(self, seconds: float) -> None:
+        with self._timeout_lock:
+            if self._timeout_timer is not None:
+                return
+            timer = threading.Timer(seconds, self._on_timeout, args=(seconds,))
+            self._timeout_timer = timer
+            self._timeout_seconds = seconds
+        timer.daemon = True
+        timer.start()
+
+    def _cancel_timeout(self) -> None:
+        with self._timeout_lock:
+            timer, self._timeout_timer = self._timeout_timer, None
+        if timer is not None:
+            timer.cancel()
+
+    def _on_timeout(self, seconds: float) -> None:
+        self._timed_out.set()
+        self.kill(grace=1.0)
 
     def _pump(self) -> None:
         import selectors
@@ -548,6 +624,7 @@ class BashHandle:
                 cast("_winjob.JobProcess", self._proc).close()
         with self._callback_lock:
             callback, self._reap_callback = self._reap_callback, None
+        self._cancel_timeout()
         if callback is not None:
             callback()
         if delivered:
@@ -643,11 +720,17 @@ class BashHandle:
         with self._callback_lock:
             if self._done.is_set():
                 return
+            timed_out = self._timed_out.is_set()
+            if timed_out and exit_code != 0:
+                # GNU-timeout convention: a killed command reports 124, not the
+                # signal death of the group leader.
+                exit_code = _TIMEOUT_EXIT_CODE
             self._result = BashResult(
                 exit_code=exit_code,
                 output=self._buffer.text() if output is None else output,
                 duration=time.monotonic() - self._started,
             )
+            self._result_timed_out = timed_out
             self._done.set()
             callbacks = self._callbacks
             self._callbacks = []
@@ -822,9 +905,12 @@ class BashHandle:
         # a kernel interrupt) must not leave the command running. TERM, bounded
         # grace, group KILL, then a bounded confirmed-exit wait before the
         # CancelledError propagates, so no side effect can land after it.
+        if not self._timeout_disabled and self._timeout_timer is None:
+            self._arm_timeout(_default_one_shot_timeout())
         try:
-            return await self._wait()
+            result = await self._wait()
         except asyncio.CancelledError:
+            self._cancel_timeout()
             # Signal synchronously first: even if the cleanup awaits below are
             # re-cancelled, TERM is already delivered and the escalation timer
             # armed. The confirm wait runs as a shielded task so repeated
@@ -839,6 +925,10 @@ class BashHandle:
                 except asyncio.CancelledError:
                     continue
             raise
+        if self._result_timed_out:
+            assert self._timeout_seconds is not None
+            raise BashTimeoutError(_timeout_message(self._timeout_seconds))
+        return result
 
     async def _confirm_group_exit(self) -> None:
         if not await self._await_group_death(_CANCEL_TERM_GRACE):
@@ -878,6 +968,7 @@ class BashHandle:
         # Enrollment or containment failed before the gate opened (POSIX) or
         # while the child is still suspended, before resume (Windows): kill
         # the child and unwind the handle before threads start.
+        self._cancel_timeout()
         if _IS_POSIX:
             for fd in (self._status_read, self._wake_read, self._wake_write):
                 if fd >= 0:
@@ -951,15 +1042,25 @@ class BashHandle:
         return f"<BashHandle pid={self._pid} {state} command={self.command!r}>"
 
 
-def bash(command: str) -> BashHandle:
+def bash(command: str, timeout: float | None = None) -> BashHandle:
     """Start a shell command immediately; await the handle for the result.
 
     `await bash(cmd)` is a one-shot: cancelling the await (e.g. an interrupt)
-    kills the command's process group. `h = bash(cmd)` used as a background
-    handle (any .pid/.running/.output()/.tail()/.poll()/.kill() access before
-    the first await) survives cancellation; awaiting it only waits. Leak
-    containment is per-platform: process groups plus the orphan journal on
-    POSIX; a kill-on-close job object on Windows entered while the child is
+    kills the command's process group. One-shot awaits are bounded by a
+    default timeout (120s, configurable via PRIME_AGENT_BASH_DEFAULT_TIMEOUT;
+    0 disables it) — on expiry the process group is killed and the await
+    raises BashTimeoutError with recovery instructions. `h = bash(cmd)` used
+    as a background handle (any .pid/.running/.output()/.tail()/.poll()/
+    .kill() access before the first await) survives cancellation; awaiting it
+    only waits, and the default timeout never applies to it.
+
+    Pass `timeout=<seconds>` to bound any usage explicitly: the timer arms at
+    spawn and kills the process group on expiry (a timed-out result reports
+    exit code 124; an owned await raises BashTimeoutError instead). Pass
+    `timeout=0` to disable bounding entirely.
+
+    Leak containment is per-platform: process groups plus the orphan journal
+    on POSIX; a kill-on-close job object on Windows entered while the child is
     still suspended, so no descendant can escape it and kill()/crash cleanup
     are unconditional -- bash() raises if containment cannot be established.
     Output written after the completion fence (e.g. by an EXIT trap or a
@@ -968,8 +1069,12 @@ def bash(command: str) -> BashHandle:
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0
+    ):
+        raise TypeError("timeout must be a non-negative number of seconds (0 disables the timeout)")
     _install_shutdown_hook()
-    return BashHandle(command)
+    return BashHandle(command, timeout)
 
 
 def _shell() -> str:

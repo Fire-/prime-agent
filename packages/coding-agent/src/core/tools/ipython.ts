@@ -200,6 +200,12 @@ const BUSY_KERNEL_PROMPT = [
 	"Ctrl+C sent an interrupt, but the previous cell has not stopped yet. A new command cannot start until it finishes.",
 	"Waiting preserves the current kernel state. Killing restarts the kernel and loses in-memory variables, imports, and running tasks.",
 ].join("\n");
+
+// A cell awaiting a silent command (e.g. `await bash(...)` on a hung curl)
+// produces no stream events, which headless consumers read as a stalled turn.
+// Periodic still-running updates keep the tool visibly live.
+const IPYTHON_HEARTBEAT_INTERVAL_MS = 30_000;
+const IPYTHON_HEARTBEAT_TAIL_CHARS = 2_000;
 const KERNEL_RESTART_NOTICE = [
 	"<ipython_kernel_reset>",
 	"The Python kernel was restarted after a previous interrupted cell kept running. Variables, imports, async tasks, and open resources from before the restart are no longer available; recreate them before using them.",
@@ -704,6 +710,25 @@ export function createIpythonToolDefinition(
 				});
 			};
 
+			const cellStartedAt = Date.now();
+			let lastStreamAt = cellStartedAt;
+			let streamTail = "";
+			const heartbeat = setInterval(() => {
+				if (Date.now() - lastStreamAt < IPYTHON_HEARTBEAT_INTERVAL_MS) {
+					return;
+				}
+				const elapsedSeconds = Math.round((Date.now() - cellStartedAt) / 1000);
+				onUpdate?.({
+					content: [
+						{
+							type: "text",
+							text: `${streamTail}[ipython cell still running (${elapsedSeconds}s elapsed)]`,
+						},
+					],
+					details: { status: "ok" },
+				});
+			}, IPYTHON_HEARTBEAT_INTERVAL_MS);
+
 			try {
 				const { result: r, kernelRestarted } = await executeWithBusyKernelChoice(
 					provisioner,
@@ -712,6 +737,8 @@ export function createIpythonToolDefinition(
 					params.code,
 					signal,
 					(chunk) => {
+						lastStreamAt = Date.now();
+						streamTail = `${streamTail}${chunk}`.slice(-IPYTHON_HEARTBEAT_TAIL_CHARS);
 						onUpdate?.({
 							content: [{ type: "text", text: chunk }],
 							details: { status: "ok" },
@@ -757,6 +784,7 @@ export function createIpythonToolDefinition(
 					isError: r.status === "error" || r.status === "aborted",
 				};
 			} finally {
+				clearInterval(heartbeat);
 				if (hasWorkingMessage) {
 					setToolWorkingMessage();
 				}
