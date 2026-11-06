@@ -74,6 +74,9 @@ const { fakeMistralStream } = vi.hoisted(() => {
 });
 
 vi.mock("@mistralai/mistralai", () => ({
+	HTTPClient: class {
+		constructor(public options: unknown) {}
+	},
 	Mistral: class {
 		chat = {
 			stream: async () => fakeMistralStream,
