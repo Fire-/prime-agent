@@ -1,0 +1,1 @@
+- `/reload` now works as a session-level command in every client, not just the TUI. Daemon, RPC, and ACP clients can submit `/reload` to re-read settings, auth, MCP servers, skills, and prompts and rebuild the runtime in place; the TUI keeps its existing local `/reload` behavior. The command refuses to run while a response is streaming or compaction is in progress.

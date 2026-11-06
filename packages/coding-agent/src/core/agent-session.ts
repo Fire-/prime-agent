@@ -7397,6 +7397,18 @@ export class AgentSession {
 				case "autonomous":
 					await this._handleAutonomousSlashCommand(input.text);
 					break;
+				case "reload":
+					// Mirrors the TUI's /reload guard: a reload rebuilds the runtime,
+					// which must not happen under a live turn or compaction.
+					if (this.isStreaming) {
+						throw new Error("Wait for the current response to finish before reloading.");
+					}
+					if (this.isCompacting) {
+						throw new Error("Wait for compaction to finish before reloading.");
+					}
+					await this.reload();
+					resultText = "Reloaded settings, MCP servers, and runtime.";
+					break;
 			}
 			if (resultText) {
 				this._appendDurableSessionCommandMessage(resultText, input.command, true, false, displayResult);
