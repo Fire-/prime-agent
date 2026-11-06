@@ -18,6 +18,7 @@ export type StreamFailureKind =
 	| "permission"
 	| "invalid_request"
 	| "malformed_response"
+	| "degenerate_stop"
 	| "unknown";
 
 export interface StreamFailureInfo {
@@ -52,6 +53,7 @@ const KIND_MESSAGES: Record<StreamFailureKind, string> = {
 	permission: "Provider denied access to the requested resource",
 	invalid_request: "Provider rejected the request",
 	malformed_response: "Provider returned a malformed response",
+	degenerate_stop: "Provider returned a degenerate response",
 	unknown: "Provider stream failed",
 };
 

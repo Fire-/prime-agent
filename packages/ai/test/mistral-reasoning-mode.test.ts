@@ -45,10 +45,17 @@ async function capturePayload(
 }
 
 describe("Mistral reasoning mode selection", () => {
-	it("uses reasoning_effort for Mistral Small 4", async () => {
-		const payload = await capturePayload(getFixtureModel<"mistral-conversations">("mistral", "mistral-small-2603")!, {
-			reasoning: "medium",
-		});
+	const glmModel = {
+		...getFixtureModel<"mistral-conversations">("mistral", "mistral-medium-3.5")!,
+		id: "zai-glm-5-3",
+	};
+
+	it.each([
+		["Mistral Small 4", getFixtureModel<"mistral-conversations">("mistral", "mistral-small-2603")!],
+		["Mistral Medium 3.5", getFixtureModel<"mistral-conversations">("mistral", "mistral-medium-3.5")!],
+		["GLM, which Mistral rejects prompt_mode for", glmModel],
+	])("uses reasoning_effort for %s", async (_name, model) => {
+		const payload = await capturePayload(model, { reasoning: "medium" });
 
 		expect(payload.reasoningEffort).toBe("high");
 		expect(payload.promptMode).toBeUndefined();
@@ -71,15 +78,6 @@ describe("Mistral reasoning mode selection", () => {
 
 		expect(payload.promptMode).toBe("reasoning");
 		expect(payload.reasoningEffort).toBeUndefined();
-	});
-
-	it("uses reasoning_effort for Mistral Medium 3.5", async () => {
-		const payload = await capturePayload(getFixtureModel<"mistral-conversations">("mistral", "mistral-medium-3.5")!, {
-			reasoning: "medium",
-		});
-
-		expect(payload.reasoningEffort).toBe("high");
-		expect(payload.promptMode).toBeUndefined();
 	});
 
 	it("omits reasoning controls for Mistral Medium 3.5 when thinking is off", async () => {
@@ -128,5 +126,49 @@ describe("Mistral tool schema serialization", () => {
 		}
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).not.toContain("Input validation failed");
+	});
+});
+
+describe("Mistral history serialization", () => {
+	it("coalesces adjacent thinking blocks into one leading chunk", async () => {
+		const model = {
+			...getFixtureModel<"mistral-conversations">("mistral", "magistral-medium-latest")!,
+			baseUrl: "http://127.0.0.1:9",
+		} as Model<"mistral-conversations">;
+		let serialized: unknown[] | undefined;
+		await streamSimple(
+			model,
+			{
+				messages: [
+					{ role: "user", content: "hello", timestamp: 1 },
+					{
+						role: "assistant",
+						provider: "mistral",
+						api: "mistral-conversations",
+						model: "magistral-medium-latest",
+						stopReason: "stop",
+						usage: {},
+						content: [
+							{ type: "thinking", thinking: "first part" },
+							{ type: "text", text: "" },
+							{ type: "thinking", thinking: "second part" },
+						],
+						timestamp: 2,
+					} as never,
+				],
+			} as Context,
+			{
+				apiKey: "fake-key",
+				onPayload: (payload) => {
+					serialized = (payload as { messages: Array<{ role: string; content?: unknown[] }> }).messages
+						.at(-1)
+						?.content?.filter((part) => (part as { type?: string }).type === "thinking");
+					return payload;
+				},
+			},
+		).result();
+		expect(serialized).toEqual([
+			{ type: "thinking", thinking: [{ type: "text", text: "first part\n\nsecond part" }] },
+		]);
 	});
 });
