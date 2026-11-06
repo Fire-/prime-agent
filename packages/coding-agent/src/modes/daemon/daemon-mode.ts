@@ -4493,7 +4493,13 @@ export class AgentDaemon {
 					images: command.images,
 					streamingBehavior: command.streamingBehavior,
 					queueIfBusy: command.queueIfBusy ?? command.streamingBehavior !== undefined,
-					resumeIfIdle: command.streamingBehavior !== undefined,
+					// A user abort leaves the input pump suspended until the next input
+					// resumes it; a plain prompt must therefore resume (an update-restart
+					// suspension must survive until the restart completes).
+					resumeIfIdle:
+						command.streamingBehavior !== undefined ||
+						(state.runtime.session.isQueuedWorkSuspended &&
+							!state.runtime.session.isQueuedWorkSuspendedForUpdateRestart),
 					expandPromptTemplates: command.expandPromptTemplates,
 					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
 					source: command.source,

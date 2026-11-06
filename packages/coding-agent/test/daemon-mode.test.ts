@@ -4242,3 +4242,80 @@ describe("session replacement binding", () => {
 		expect(broadcasts).toEqual(["session_replaced"]);
 	});
 });
+
+describe("daemon prompt admission after abort", () => {
+	const makeDaemon = () =>
+		new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+
+	const makeWritableClient = (id: string, activeSessionId: string): DaemonSocketClient =>
+		({
+			id,
+			socket: { destroyed: false, write: vi.fn(() => true) },
+			attachedActiveSessionIds: new Set([activeSessionId]),
+			detachInput: vi.fn(),
+			capabilities: new Set(),
+		}) as unknown as DaemonSocketClient;
+
+	const makeSuspendedPromptState = (suspendedForUpdateRestart: boolean) => {
+		const promptOptions: Array<{ resumeIfIdle?: boolean }> = [];
+		const state = makeState("active-post-abort-prompt");
+		state.runtime = {
+			...state.runtime,
+			session: {
+				promptUntilAccepted: vi.fn(
+					async (
+						_message: string,
+						opts: { resumeIfIdle?: boolean; preflightResult?: (didSucceed: boolean) => void },
+					) => {
+						promptOptions.push({ resumeIfIdle: opts.resumeIfIdle });
+						opts.preflightResult?.(true);
+					},
+				),
+				isQueuedWorkSuspended: true,
+				isQueuedWorkSuspendedForUpdateRestart: suspendedForUpdateRestart,
+			},
+		} as never;
+		return { state, promptOptions };
+	};
+
+	it("resumes a plain-abort input suspension for client prompts", async () => {
+		const daemon = makeDaemon();
+		const { state, promptOptions } = makeSuspendedPromptState(false);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		await internals.handleCommand(makeWritableClient("client-1", state.activeSessionId), {
+			type: "prompt",
+			activeSessionId: state.activeSessionId,
+			message: "follow up after abort",
+		} as never);
+
+		expect(promptOptions).toEqual([{ resumeIfIdle: true }]);
+	});
+
+	it("keeps an update-restart suspension intact for client prompts", async () => {
+		const daemon = makeDaemon();
+		const { state, promptOptions } = makeSuspendedPromptState(true);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		await internals.handleCommand(makeWritableClient("client-1", state.activeSessionId), {
+			type: "prompt",
+			activeSessionId: state.activeSessionId,
+			message: "prompt during update restart",
+		} as never);
+
+		expect(promptOptions).toEqual([{ resumeIfIdle: false }]);
+	});
+});
